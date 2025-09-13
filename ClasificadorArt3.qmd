@@ -1,0 +1,196 @@
+---
+title: "Articulo 3 Codigo "
+format: html
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+library(tidytext)
+library(Matrix)
+library(naivebayes)
+library(stringr)
+
+set.seed(123)
+
+df0 <- readr::read_csv("~/Desktop/Data_ghosts/ghostbusters_dataset.csv", show_col_types = FALSE) |>
+  mutate(
+    label = factor(label, levels = c("Other", "Haunted Places")),
+    story = str_squish(story)
+  ) |>
+  filter(!is.na(story), nchar(story) > 20)
+
+stopifnot(all(c("id", "label", "story") %in% names(df0)))
+n_docs <- nrow(df0)
+cat("# docs totales:", n_docs, "\n")
+print(table(df0$label)); cat("\n")
+
+# Tokenización + limpieza ligera
+data("stop_words")  
+
+bow <- df0 |>
+  select(id, label, story) |>
+  unnest_tokens(word, story) |>
+  anti_join(stop_words, by = "word") |>
+  filter(!str_detect(word, "^\\d+$"), str_length(word) >= 2)
+
+df_term <- bow |>
+  distinct(id, word) |>
+  count(word, name = "df")
+
+min_df <- 3
+max_df <- floor(0.85 * n_docs)
+
+lexicon <- df_term |>
+  filter(df >= min_df, df <= max_df) |>
+  pull(word)
+
+bow2 <- bow |>
+  filter(word %in% lexicon) |>
+  count(id, word, name = "n")
+
+# Matriz Dispersa
+X <- tidytext::cast_sparse(bow2, id, word, n) 
+rows <- as.integer(rownames(X))
+y <- df0$label[match(rows, df0$id)] |> factor(levels = levels(df0$label))
+stopifnot(length(y) == nrow(X))
+
+# Split Train/Test (80/20) estratificado simple
+split_strat <- function(y, p = 0.8) {
+  idx <- unlist(tapply(seq_along(y), y, function(ii) sample(ii, floor(p * length(ii)))))
+  list(train = sort(idx), test = setdiff(seq_along(y), idx))
+}
+sp <- split_strat(y, p = 0.8)
+train_idx <- sp$train
+test_idx  <- sp$test
+
+Xtr <- X[train_idx, , drop = FALSE]
+Xte <- X[test_idx,  , drop = FALSE]
+ytr <- y[train_idx]
+yte <- y[test_idx]
+
+cat("\nDistribución de clases (total):\n")
+print(table(y))
+cat("\n# docs train:", length(ytr), "\n# docs test :", length(yte), "\n\n")
+
+# NB Gauss de TF-IDF + L2  
+df_tr <- Matrix::colSums(sign(Xtr))
+idf_tr <- log1p(nrow(Xtr) / (df_tr + 1))  # idf suavizado
+
+Xte <- Xte[, colnames(Xtr), drop = FALSE]
+
+# TF-IDF
+Xtf_tr <- Xtr %*% Diagonal(x = idf_tr)
+Xtf_te <- Xte %*% Diagonal(x = idf_tr)
+
+# Normalización L2
+l2_norm_rows <- function(M) {
+  rs <- sqrt(Matrix::rowSums(M^2))
+  rs[rs == 0] <- 1
+  Diagonal(x = 1 / rs) %*% M
+}
+Xtf_tr <- l2_norm_rows(Xtf_tr)
+Xtf_te <- l2_norm_rows(Xtf_te)
+
+# Métricas y utilidades
+levels_bin <- c("Other", "Haunted Places")
+
+metrics <- function(truth, pred, positive = "Haunted Places") {
+  truth <- factor(truth, levels = levels_bin)
+  pred  <- factor(pred,  levels = levels_bin)
+  cm <- table(truth, pred)
+
+  tp <- cm[positive, positive]
+  fp <- sum(cm[, positive]) - tp
+  fn <- sum(cm[positive, ]) - tp
+  tn <- sum(cm) - tp - fp - fn
+
+  acc <- (tp + tn) / sum(cm)
+  prec <- ifelse(tp + fp == 0, 0, tp / (tp + fp))
+  rec  <- ifelse(tp + fn == 0, 0, tp / (tp + fn))
+  f1   <- ifelse(prec + rec == 0, 0, 2 * prec * rec / (prec + rec))
+  list(confusion = cm, accuracy = acc, precision = prec, recall = rec, f1 = f1)
+}
+
+best_threshold <- function(y_true, probs_pos, grid = seq(0.30, 0.70, by = 0.01)) {
+  best <- tibble(tau = NA_real_, f1 = -Inf, acc = NA_real_, prec = NA_real_, rec = NA_real_)
+  for (t in grid) {
+    pred <- ifelse(probs_pos >= t, "Haunted Places", "Other") |>
+      factor(levels = levels_bin)
+    m <- metrics(y_true, pred)
+    if (is.na(best$f1) || m$f1 > best$f1) {
+      best <- tibble(tau = t, f1 = m$f1, acc = m$accuracy, prec = m$precision, rec = m$recall)
+    }
+  }
+  best
+}
+
+print_res <- function(ttl, res) {
+  cat("\n===", ttl, "===\n")
+  print(res$confusion)
+  cat(sprintf("Accuracy : %.3f\nPrecision: %.3f\nRecall   : %.3f\nF1-score : %.3f\n",
+              res$accuracy, res$precision, res$recall, res$f1))
+}
+
+# NB Gaussiano (TF-IDF + L2)
+sp_in <- split_strat(ytr, p = 0.8)
+tr_in  <- sp_in$train
+val_in <- sp_in$test
+
+nb_g_in <- naive_bayes(x = as.matrix(Xtf_tr[tr_in, , drop = FALSE]),
+                       y = ytr[tr_in],
+                       laplace = 1) 
+
+p_in <- predict(nb_g_in, as.matrix(Xtf_tr[val_in, , drop = FALSE]), type = "prob")[, "Haunted Places"]
+
+bt <- best_threshold(ytr[val_in], p_in, grid = seq(0.30, 0.70, by = 0.01))
+cat(sprintf("Umbral óptimo (validación) para HP: tau=%.2f  [F1=%.3f, Acc=%.3f, Prec=%.3f, Rec=%.3f]\n",
+            bt$tau, bt$f1, bt$acc, bt$prec, bt$rec))
+
+# re-entreno en train y evaluación en test
+nb_g <- naive_bayes(x = as.matrix(Xtf_tr),
+                    y = ytr,
+                    laplace = 1)
+
+# corte estándar 0.5
+pred_g_05 <- predict(nb_g, as.matrix(Xtf_te))
+res_g_05  <- metrics(yte, pred_g_05)
+print_res("Naïve Bayes (gaussiano + TF-IDF + L2 + Laplace=1)  [tau=0.50]", res_g_05)
+
+# corte óptimo
+pr_test <- predict(nb_g, as.matrix(Xtf_te), type = "prob")[, "Haunted Places"]
+pred_g_tau <- ifelse(pr_test >= bt$tau, "Haunted Places", "Other") |>
+  factor(levels = levels_bin)
+res_g_tau <- metrics(yte, pred_g_tau)
+print_res(paste0("Naïve Bayes (gaussiano + TF-IDF + L2 + Laplace=1)  [tau=", sprintf("%.2f", bt$tau), "]"),
+          res_g_tau)
+
+# NB Poisson con conteos con grid de Laplace
+lap_grid <- 0:2
+res_p_best <- NULL
+best_lap <- NA
+
+for (lap in lap_grid) {
+  nb_p <- naive_bayes(x = as.matrix(Xtr), y = ytr, laplace = lap, usepoisson = TRUE)
+  pred_p <- predict(nb_p, as.matrix(Xte))
+  res_p  <- metrics(yte, pred_p)
+  if (is.null(res_p_best) || res_p$f1 > res_p_best$f1) {
+    res_p_best <- res_p
+    best_lap <- lap
+  }
+}
+print_res(paste0("Naïve Bayes (Poisson + mejor Laplace en grid con conteos)  [lap=", best_lap, "]"),
+          res_p_best)
+
+# Top términos promedio
+hp_rows <- which(ytr == "Haunted Places")
+if (length(hp_rows) > 0) {
+  means_hp <- Matrix::colMeans(Xtr[hp_rows, , drop = FALSE])
+  ord <- order(means_hp, decreasing = TRUE)
+  top_k <- 20
+  sel <- head(ord, min(top_k, length(ord)))
+  cat("\nTop términos para 'Haunted Places':\n")
+  tt <- tibble(term = colnames(Xtr)[sel], mean = round(means_hp[sel], 3))
+  print(tt, n = nrow(tt))
+}
+```
